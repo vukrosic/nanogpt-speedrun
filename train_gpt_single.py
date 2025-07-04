@@ -6,6 +6,7 @@ import uuid
 import time
 import copy
 import glob
+import signal
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -395,6 +396,15 @@ def simple_data_generator(filename_pattern: str, seq_len: int):
 print(f"[DEBUG] Data loader defined")
 
 # -----------------------------------------------------------------------------
+# Timeout handler for compilation
+
+class CompilationTimeout(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise CompilationTimeout("Model compilation timed out")
+
+# -----------------------------------------------------------------------------
 # int main
 
 @dataclass
@@ -497,28 +507,51 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(512 * x, n=128)  # Much smaller than original 1728
     return get_window_size_blocks_helper(window_size)
 
+# Debug and compilation settings
+print0("[DEBUG] Setting up compilation debugging...", console=True)
+import torch._dynamo
+torch._dynamo.config.verbose = True
+
 print0("[DEBUG] About to compile model - this may take a while...", console=True)
 compilation_start = time.perf_counter()
 
-# Add compilation debugging
-import torch._dynamo
-torch._dynamo.config.verbose = True
-torch._dynamo.config.log_level = "INFO"
-
 # Make compilation optional for debugging
 USE_COMPILE = True  # Set to False to disable compilation for debugging
+COMPILATION_TIMEOUT = 300  # 5 minutes timeout
+
 if USE_COMPILE:
-    model: nn.Module = torch.compile(model, dynamic=False)
-    print0(f"[DEBUG] Model compiled in {time.perf_counter() - compilation_start:.1f}s", console=True)
-else:
-    print0("[DEBUG] Skipping model compilation for debugging", console=True)
+    try:
+        # Set up timeout
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(COMPILATION_TIMEOUT)
+        
+        print0(f"[DEBUG] Starting compilation with {COMPILATION_TIMEOUT}s timeout...", console=True)
+        model: nn.Module = torch.compile(model, dynamic=False)
+        
+        # Cancel timeout
+        signal.alarm(0)
+        
+        compilation_time = time.perf_counter() - compilation_start
+        print0(f"[DEBUG] Model compiled successfully in {compilation_time:.1f}s", console=True)
+        
+    except CompilationTimeout:
+        signal.alarm(0)  # Cancel timeout
+        print0("[ERROR] Model compilation timed out! Falling back to non-compiled model.", console=True)
+        USE_COMPILE = False
+    except Exception as e:
+        signal.alarm(0)  # Cancel timeout
+        print0(f"[ERROR] Model compilation failed: {e}. Falling back to non-compiled model.", console=True)
+        USE_COMPILE = False
+
+if not USE_COMPILE:
+    print0("[DEBUG] Using non-compiled model", console=True)
 
 ########################################
 #            Warmup kernels            #
 ########################################
 
 print0("[DEBUG] Starting warmup phase...", console=True)
-warmup_steps = 5  # Reduced warmup
+warmup_steps = 3  # Further reduced warmup for debugging
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers])
 

@@ -12,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS"] = "1"  # Fix graph breaks
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
@@ -256,6 +257,33 @@ class Block(nn.Module):
 print(f"[DEBUG] Model layers defined")
 
 # -----------------------------------------------------------------------------
+# Simple causal mask for debugging
+
+def create_simple_causal_mask(seq_len: int, block_size: int = 128) -> BlockMask:
+    """Create a simple causal mask without the complex document logic."""
+    num_blocks = seq_len // block_size
+    
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+    
+    # Simple causal block mask
+    block_idx = torch.arange(num_blocks, dtype=torch.int32, device="cuda")
+    causal_blockmask = block_idx[:, None] >= block_idx
+    
+    # Convert to the format expected by BlockMask.from_kv_blocks
+    num_blocks_tensor = causal_blockmask.sum(dim=-1, dtype=torch.int32)
+    indices = causal_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+    
+    return BlockMask.from_kv_blocks(
+        num_blocks_tensor[None, None].contiguous(),
+        indices[None, None].contiguous(),
+        torch.zeros(1, 1, num_blocks, dtype=torch.int32, device="cuda"),  # No full blocks
+        torch.zeros(1, 1, num_blocks, 0, dtype=torch.int32, device="cuda"),  # Empty indices
+        BLOCK_SIZE=block_size,
+        mask_mod=causal_mask,
+    )
+
+# -----------------------------------------------------------------------------
 # The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
@@ -273,59 +301,15 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_()
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
-        print(f"[DEBUG] GPT model initialized")
+        self.num_layers = num_layers  # Store for debugging
+        print(f"[DEBUG] GPT model initialized with {num_layers} layers")
 
-    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        print(f"[DEBUG] Creating blockmasks for seq_len={len(input_seq)}, window_blocks={sliding_window_num_blocks.item()}")
-        t_start = time.perf_counter()
+    def create_blockmasks_simple(self, input_seq: Tensor) -> tuple[BlockMask, BlockMask]:
+        """Simplified blockmask creation for debugging."""
+        print(f"[DEBUG] Creating simple causal masks for seq_len={len(input_seq)}")
         
-        BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
-
-        def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
-
-        def dense_to_ordered(dense_blockmask: Tensor):
-            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
-
-        assert len(input_seq) % BLOCK_SIZE == 0
-        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        print(f"[DEBUG] NUM_BLOCKS={NUM_BLOCKS}")
-        
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
-        causal_blockmask_any = block_idx[:, None] >= block_idx
-        causal_blockmask_all = block_idx[:, None] > block_idx
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-        document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
-        document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
-        blockmask_any = causal_blockmask_any & document_blockmask_any
-        blockmask_all = causal_blockmask_all & document_blockmask_all
-        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
-        full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
-        
-        print(f"[DEBUG] Dense operations complete, creating BlockMask...")
-        
-        def build_bm(window_size_blocks: Tensor) -> BlockMask:
-            return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
-                partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1),
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
-        
-        long_bm = build_bm(sliding_window_num_blocks)
-        short_bm = build_bm(sliding_window_num_blocks // 2)
-        
-        t_end = time.perf_counter()
-        print(f"[DEBUG] Blockmasks created in {(t_end - t_start) * 1000:.1f}ms")
-        return long_bm, short_bm
+        mask = create_simple_causal_mask(len(input_seq))
+        return mask, mask  # Use same mask for both long and short
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         print(f"[DEBUG] Model forward: input_seq.shape={input_seq.shape}")
@@ -333,13 +317,28 @@ class GPT(nn.Module):
 
         print(f"[DEBUG] Creating value embeddings...")
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
+        
+        # Adjust value embeddings to match number of layers
+        if len(self.blocks) == 8:
+            # For 8 layers: ve at layers 0,1,2 and 5,6,7
+            ve = [ve[0], ve[1], ve[2]] + [None] * 2 + [ve[0], ve[1], ve[2]]
+        else:
+            # Original 12 layer pattern
+            ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        
+        assert len(ve) == len(self.blocks), f"ve length {len(ve)} != blocks length {len(self.blocks)}"
 
         print(f"[DEBUG] Creating block masks...")
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
-        assert len(block_masks) == len(self.blocks)
+        long_bm, short_bm = self.create_blockmasks_simple(input_seq)
+        
+        # Create block masks for each layer - adjust for 8 layers
+        if len(self.blocks) == 8:
+            block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm]
+        else:
+            # Original 12 layer pattern
+            block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        
+        assert len(block_masks) == len(self.blocks), f"block_masks length {len(block_masks)} != blocks length {len(self.blocks)}"
 
         print(f"[DEBUG] Running embeddings...")
         x = x0 = norm(self.embed(input_seq)[None])
@@ -560,7 +559,6 @@ for warmup_step in range(warmup_steps):
     warmup_start = time.perf_counter()
     
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    print0(f"[DEBUG] Created random tensors in {(time.perf_counter() - warmup_start) * 1000:.1f}ms", console=True)
     
     forward_start = time.perf_counter()
     loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0))

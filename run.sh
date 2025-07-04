@@ -1,1 +1,1 @@
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+torchrun --standalone --nproc_per_node=2 train_gpt_two_gpus.py

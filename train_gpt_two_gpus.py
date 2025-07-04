@@ -20,13 +20,13 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
-# Add to your imports
 from deep_gemm.jit_kernels import (
     gemm_fp8_fp8_bf16_nt,
     wgrad_gemm_fp8_fp8_fp32_nt,
-    ceil_div
+    ceil_div,
+    set_num_sms,
+    get_num_sms
 )
-from deep_gemm.utils import set_num_sms
 
 # In your main function, set the number of SMs
 set_num_sms(torch.cuda.get_device_properties().multi_processor_count)

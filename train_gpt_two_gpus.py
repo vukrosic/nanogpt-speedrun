@@ -290,25 +290,34 @@ def norm(x: Tensor):
 #             return F.linear(x, self.weight.type_as(x))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s  
+        self.grad_s = grad_s
         
         if use_fp8:
             from deep_gemm.jit_kernels import ceil_div
             
-            # Ensure dimensions are aligned to 128
+            # Ensure dimensions are aligned to 128 for DeepGEMM
             if in_features % 128 != 0:
                 raise ValueError(f"in_features ({in_features}) must be divisible by 128 for DeepGEMM")
             
-            # LHS scaling: [m, ⌈k / 128⌉] - will be set dynamically based on batch
+            # DeepGEMM scaling tensors
             self.k_blocks = ceil_div(in_features, 128)
+            self.n_blocks = ceil_div(out_features, 128)
             
             # RHS scaling: [⌈n / 128⌉, ⌈k / 128⌉]  
-            self.n_blocks = ceil_div(out_features, 128)
             self.register_buffer('w_scales', 
                 torch.ones(self.n_blocks, self.k_blocks, dtype=torch.float32), 
                 persistent=False)
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
 
     def forward(self, x: Tensor):
         if self.use_fp8 and self.training:
@@ -323,7 +332,7 @@ class CastedLinear(nn.Linear):
             self._update_scales(x.view(-1, x.size(-1)), self.weight, x_scales)
             
             _x = x.flatten(0, -2)
-            out = torch.ops.nanogpt.mm(_x, self.weight, x_scales, self.w_scales, 1.0)[0]
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_scales, self.w_scales, self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
             return F.linear(x, self.weight.type_as(x))
@@ -332,13 +341,28 @@ class CastedLinear(nn.Linear):
         from deep_gemm.jit_kernels import ceil_div
         
         # Update LHS scales: per-batch, per-128-channels
-        x_reshaped = x.view(x.size(0), -1, 128)  # [batch, k_blocks, 128]
-        x_scales.copy_(x_reshaped.abs().amax(dim=2) / 448.0)  # [batch, k_blocks]
+        if x.size(1) % 128 == 0:
+            x_reshaped = x.view(x.size(0), -1, 128)  # [batch, k_blocks, 128]
+            x_scales.copy_(x_reshaped.abs().amax(dim=2) / 448.0)  # [batch, k_blocks]
+        else:
+            # Handle non-aligned case by padding
+            pad_size = 128 - (x.size(1) % 128)
+            x_padded = F.pad(x, (0, pad_size))
+            x_reshaped = x_padded.view(x_padded.size(0), -1, 128)
+            x_scales.copy_(x_reshaped.abs().amax(dim=2) / 448.0)
         
         # Update RHS scales: per-128x128 blocks (less frequent updates)
         if not hasattr(self, '_w_scales_initialized') or torch.rand(1).item() < 0.01:  # Update 1% of the time
-            w_reshaped = w.view(self.n_blocks, 128, self.k_blocks, 128)  # [n_blocks, 128, k_blocks, 128]
-            self.w_scales.copy_(w_reshaped.abs().amax(dim=(1, 3)) / 448.0)  # [n_blocks, k_blocks]
+            if w.size(0) % 128 == 0 and w.size(1) % 128 == 0:
+                w_reshaped = w.view(self.n_blocks, 128, self.k_blocks, 128)  # [n_blocks, 128, k_blocks, 128]
+                self.w_scales.copy_(w_reshaped.abs().amax(dim=(1, 3)) / 448.0)  # [n_blocks, k_blocks]
+            else:
+                # Handle non-aligned weights by padding
+                pad_h = 128 - (w.size(0) % 128) if w.size(0) % 128 != 0 else 0
+                pad_w = 128 - (w.size(1) % 128) if w.size(1) % 128 != 0 else 0
+                w_padded = F.pad(w, (0, pad_w, 0, pad_h))
+                w_reshaped = w_padded.view(self.n_blocks, 128, self.k_blocks, 128)
+                self.w_scales.copy_(w_reshaped.abs().amax(dim=(1, 3)) / 448.0)
             self._w_scales_initialized = True
 
 class Rotary(nn.Module):

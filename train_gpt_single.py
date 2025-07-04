@@ -18,6 +18,8 @@ import torch.nn.functional as F
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
+print(f"[DEBUG] Initial setup complete, CUDA available: {torch.cuda.is_available()}")
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -98,6 +100,8 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 
 mm_op.register_autograd(backward, setup_context=setup_context)
 
+print(f"[DEBUG] Custom operators registered")
+
 # -----------------------------------------------------------------------------
 # Simplified Muon optimizer (single GPU)
 
@@ -142,6 +146,8 @@ class Muon(torch.optim.Optimizer):
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                 p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+
+print(f"[DEBUG] Muon optimizer defined")
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -246,6 +252,8 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+print(f"[DEBUG] Model layers defined")
+
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -255,6 +263,7 @@ def next_multiple_of_n(v: float | int, *, n: int):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
+        print(f"[DEBUG] Initializing GPT model: vocab_size={vocab_size}, num_layers={num_layers}, num_heads={num_heads}, model_dim={model_dim}, max_seq_len={max_seq_len}")
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
@@ -263,8 +272,12 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_()
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
+        print(f"[DEBUG] GPT model initialized")
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+        print(f"[DEBUG] Creating blockmasks for seq_len={len(input_seq)}, window_blocks={sliding_window_num_blocks.item()}")
+        t_start = time.perf_counter()
+        
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
 
@@ -280,6 +293,8 @@ class GPT(nn.Module):
 
         assert len(input_seq) % BLOCK_SIZE == 0
         NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+        print(f"[DEBUG] NUM_BLOCKS={NUM_BLOCKS}")
+        
         block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
         causal_blockmask_any = block_idx[:, None] >= block_idx
         causal_blockmask_all = block_idx[:, None] > block_idx
@@ -291,6 +306,9 @@ class GPT(nn.Module):
         blockmask_all = causal_blockmask_all & document_blockmask_all
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
+        
+        print(f"[DEBUG] Dense operations complete, creating BlockMask...")
+        
         def build_bm(window_size_blocks: Tensor) -> BlockMask:
             return BlockMask.from_kv_blocks(
                 torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
@@ -300,35 +318,51 @@ class GPT(nn.Module):
                 BLOCK_SIZE=BLOCK_SIZE,
                 mask_mod=document_causal,
             )
-        return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+        
+        long_bm = build_bm(sliding_window_num_blocks)
+        short_bm = build_bm(sliding_window_num_blocks // 2)
+        
+        t_end = time.perf_counter()
+        print(f"[DEBUG] Blockmasks created in {(t_end - t_start) * 1000:.1f}ms")
+        return long_bm, short_bm
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        print(f"[DEBUG] Model forward: input_seq.shape={input_seq.shape}")
         assert input_seq.ndim == 1
 
+        print(f"[DEBUG] Creating value embeddings...")
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
+        print(f"[DEBUG] Creating block masks...")
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
+        print(f"[DEBUG] Running embeddings...")
         x = x0 = norm(self.embed(input_seq)[None])
 
+        print(f"[DEBUG] Running transformer blocks...")
         skip_connections = []
         n = len(self.skip_weights)
         for i in range(len(self.blocks)):
+            print(f"[DEBUG] Block {i}/{len(self.blocks)}")
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
             x = self.blocks[i](x, ve[i], x0, block_masks[i])
             if i < n:
                 skip_connections.append(x)
 
+        print(f"[DEBUG] Running final norm and lm_head...")
         x = norm(x)
         logits = self.lm_head(x).float()
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
+        print(f"[DEBUG] Forward complete, loss={loss.item():.4f}")
         return loss
+
+print(f"[DEBUG] GPT class defined")
 
 # -----------------------------------------------------------------------------
 # Simple Data Loader (single GPU)
@@ -358,6 +392,8 @@ def simple_data_generator(filename_pattern: str, seq_len: int):
         pos += seq_len
         yield inputs, targets
 
+print(f"[DEBUG] Data loader defined")
+
 # -----------------------------------------------------------------------------
 # int main
 
@@ -386,11 +422,14 @@ device = torch.device("cuda:0")
 torch.cuda.set_device(device)
 master_process = True
 
+print(f"[DEBUG] Using device: {device}")
+print(f"[DEBUG] GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
 # begin logging
 run_id = uuid.uuid4()
 os.makedirs("logs", exist_ok=True)
 logfile = f"logs/{run_id}.txt"
-print(logfile)
+print(f"[DEBUG] Logging to: {logfile}")
 
 def print0(s, console=False):
     with open(logfile, "a") as f:
@@ -409,13 +448,17 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
+print0("[DEBUG] Creating model...", console=True)
 # Smaller model for T4
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=8, num_heads=4, model_dim=512,  # Reduced from 12/6/768
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+
+print0("[DEBUG] Converting embeddings to bfloat16...", console=True)
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
 
+print0("[DEBUG] Setting up optimizers...", console=True)
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -431,6 +474,7 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+print0("[DEBUG] Setting up learning rate schedules...", console=True)
 # learning rate schedule
 def get_lr(step: int):
     x = step / args.num_iterations
@@ -453,30 +497,67 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(512 * x, n=128)  # Much smaller than original 1728
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+print0("[DEBUG] About to compile model - this may take a while...", console=True)
+compilation_start = time.perf_counter()
+
+# Add compilation debugging
+import torch._dynamo
+torch._dynamo.config.verbose = True
+torch._dynamo.config.log_level = "INFO"
+
+# Make compilation optional for debugging
+USE_COMPILE = True  # Set to False to disable compilation for debugging
+if USE_COMPILE:
+    model: nn.Module = torch.compile(model, dynamic=False)
+    print0(f"[DEBUG] Model compiled in {time.perf_counter() - compilation_start:.1f}s", console=True)
+else:
+    print0("[DEBUG] Skipping model compilation for debugging", console=True)
 
 ########################################
 #            Warmup kernels            #
 ########################################
 
+print0("[DEBUG] Starting warmup phase...", console=True)
 warmup_steps = 5  # Reduced warmup
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers])
-for _ in range(warmup_steps):
+
+for warmup_step in range(warmup_steps):
+    print0(f"[DEBUG] Warmup step {warmup_step + 1}/{warmup_steps}...", console=True)
+    warmup_start = time.perf_counter()
+    
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    print0(f"[DEBUG] Created random tensors in {(time.perf_counter() - warmup_start) * 1000:.1f}ms", console=True)
+    
+    forward_start = time.perf_counter()
+    loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0))
+    print0(f"[DEBUG] Forward pass took {(time.perf_counter() - forward_start) * 1000:.1f}ms", console=True)
+    
+    backward_start = time.perf_counter()
+    loss.backward()
+    print0(f"[DEBUG] Backward pass took {(time.perf_counter() - backward_start) * 1000:.1f}ms", console=True)
+    
+    opt_start = time.perf_counter()
     for opt in optimizers:
         opt.step()
+    print0(f"[DEBUG] Optimizer step took {(time.perf_counter() - opt_start) * 1000:.1f}ms", console=True)
+    
     model.zero_grad(set_to_none=True)
+    print0(f"[DEBUG] Warmup step {warmup_step + 1} completed in {(time.perf_counter() - warmup_start) * 1000:.1f}ms", console=True)
+
+print0("[DEBUG] Restoring initial state...", console=True)
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del initial_state
 
+print0("[DEBUG] Warmup complete!", console=True)
+
 ########################################
 #        Training and validation       #
 ########################################
 
+print0("[DEBUG] Starting training...", console=True)
 train_loader = simple_data_generator(args.train_files, args.train_seq_len)
 training_time_ms = 0
 torch.cuda.synchronize()
@@ -490,12 +571,15 @@ for step in range(train_steps + 1):
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        print0(f"[DEBUG] Starting validation at step {step}...", console=True)
         model.eval()
         val_steps = args.val_tokens // args.val_seq_len
         val_loader = simple_data_generator(args.val_files, args.val_seq_len)
         val_loss = 0
         with torch.no_grad():
-            for _ in range(val_steps):
+            for val_step in range(val_steps):
+                if val_step % 10 == 0:
+                    print0(f"[DEBUG] Validation step {val_step}/{val_steps}", console=True)
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
@@ -513,8 +597,20 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    print0(f"[DEBUG] Training step {step + 1}/{train_steps}...", console=True)
+    step_start = time.perf_counter()
+    
+    data_start = time.perf_counter()
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    print0(f"[DEBUG] Data loading took {(time.perf_counter() - data_start) * 1000:.1f}ms", console=True)
+    
+    forward_start = time.perf_counter()
+    loss = model(inputs, targets, get_window_size_blocks(step))
+    print0(f"[DEBUG] Forward pass took {(time.perf_counter() - forward_start) * 1000:.1f}ms", console=True)
+    
+    backward_start = time.perf_counter()
+    loss.backward()
+    print0(f"[DEBUG] Backward pass took {(time.perf_counter() - backward_start) * 1000:.1f}ms", console=True)
 
     # set optimization hyperparameters
     for opt in optimizers:
@@ -525,9 +621,15 @@ for step in range(train_steps + 1):
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     
     # step the optimizers
+    opt_start = time.perf_counter()
     for opt in optimizers:
         opt.step()
+    print0(f"[DEBUG] Optimizer step took {(time.perf_counter() - opt_start) * 1000:.1f}ms", console=True)
+    
     model.zero_grad(set_to_none=True)
+    
+    step_time = (time.perf_counter() - step_start) * 1000
+    print0(f"[DEBUG] Full step took {step_time:.1f}ms", console=True)
     
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

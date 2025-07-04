@@ -375,6 +375,7 @@ class GPT(nn.Module):
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        print("[torch.compile] Compiling model...")
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]

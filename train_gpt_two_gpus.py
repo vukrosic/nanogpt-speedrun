@@ -20,53 +20,27 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
-from deep_gemm.jit_kernels import (
-    gemm_fp8_fp8_bf16_nt,
-    wgrad_gemm_fp8_fp8_fp32_nt,
-    ceil_div,
-    set_num_sms,
-    get_num_sms
-)
-
-# In your main function, set the number of SMs
-set_num_sms(torch.cuda.get_device_properties().multi_processor_count)
-
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
-def mm_op(x: Tensor, w: Tensor, x_s: Tensor, w_s: Tensor, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    from deep_gemm.jit_kernels import gemm_fp8_fp8_bf16_nt, ceil_div
-    
+def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     @torch.compile
-    def impl(x: Tensor, w: Tensor, x_s: Tensor, w_s: Tensor):
+    def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
-        
-        # x: [batch, in_features]
-        # w: [out_features, in_features] 
-        # x_s: [batch, ⌈in_features/128⌉]
-        # w_s: [⌈out_features/128⌉, ⌈in_features/128⌉]
-        
-        # Scale and convert to FP8
-        x_expanded = x_s.repeat_interleave(128, dim=1)[:, :x.size(1)]  # Expand to match x
-        w_expanded = w_s.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)[:w.size(0), :w.size(1)]
-        
-        x_f8 = (x / x_expanded).to(torch.float8_e4m3fn)
-        w_f8 = (w / w_expanded).to(torch.float8_e4m3fn)
-        
-        # Prepare output
-        out = torch.empty(x.size(0), w.size(0), dtype=torch.bfloat16, device=x.device)
-        
-        # Call DeepGEMM - note the transposed w_f8 and transposed w_s
-        gemm_fp8_fp8_bf16_nt(
-            (x_f8, x_s), 
-            (w_f8.T.contiguous(), w_s.T.contiguous()),  # DeepGEMM expects transposed RHS
-            out
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
         )
-        
         return out, x_f8, w_f8
 
-    return impl(x, w, x_s, w_s)
+    return impl(x, w)
 
 @mm_op.register_fake
 def _(x: Tensor, w: Tensor, *_):
@@ -76,61 +50,35 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.is_contiguous() and w.is_contiguous()
     return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
-# @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-# def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-#     @torch.compile
-#     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-#         assert grad.is_contiguous()
-#         x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-#         w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-#         grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-#         grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-#         grad_x = torch._scaled_mm(
-#             grad_f8,
-#             w_f8.T.contiguous().T,
-#             out_dtype=torch.bfloat16,
-#             scale_a=grad_inv_s,
-#             scale_b=w_inv_s,
-#             use_fast_accum=False,
-#         )
-#         # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
-#         grad_w = torch._scaled_mm(
-#             x_f8.T.contiguous(),
-#             grad_f8.T.contiguous().T,
-#             out_dtype=torch.float32,
-#             scale_a=x_inv_s,
-#             scale_b=grad_inv_s,
-#             use_fast_accum=False,
-#         ).T
-#         return grad_x, grad_w
-
-#     return impl(g, x_f8, w_f8)
-
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: Tensor, w_s: Tensor, grad_s: float) -> tuple[Tensor, Tensor]:
-    from deep_gemm.jit_kernels import wgrad_gemm_fp8_fp8_fp32_nt
-    
-    @torch.compile  
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: Tensor, w_s: Tensor):
-        # Gradient w.r.t. input
-        grad_x = torch.empty_like(x_f8, dtype=torch.bfloat16)
-        gemm_fp8_fp8_bf16_nt(
-            (grad.to(torch.float8_e4m3fn), grad_s_tensor),
-            (w_f8, w_s), 
-            grad_x
+def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
+        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.T.contiguous().T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_inv_s,
+            scale_b=w_inv_s,
+            use_fast_accum=False,
         )
-        
-        # Gradient w.r.t. weight  
-        grad_w = torch.empty(w_f8.size(1), w_f8.size(0), dtype=torch.float32, device=w_f8.device)
-        wgrad_gemm_fp8_fp8_fp32_nt(
-            (x_f8, x_s),
-            (grad.to(torch.float8_e4m3fn), grad_s_tensor),
-            grad_w
-        )
-        
-        return grad_x, grad_w.T
+        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_inv_s,
+            scale_b=grad_inv_s,
+            use_fast_accum=False,
+        ).T
+        return grad_x, grad_w
 
-    return impl(g, x_f8, w_f8, x_s, w_s)
+    return impl(g, x_f8, w_f8)
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
@@ -152,13 +100,6 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.set_materialize_grads(False)
 
 mm_op.register_autograd(backward, setup_context=setup_context)
-
-def ensure_alignment(self):
-    # Ensure K dimension is aligned to 128
-    if self.in_features % 128 != 0:
-        padding = 128 - (self.in_features % 128)
-        self.weight = nn.Parameter(F.pad(self.weight, (0, padding)))
-        self.in_features += padding
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -267,51 +208,13 @@ class Muon(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-# class CastedLinear(nn.Linear):
-#     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
-#         super().__init__(in_features, out_features, bias=False)
-#         self.use_fp8 = use_fp8
-#         self.x_s = x_s
-#         self.w_s = w_s
-#         self.grad_s = grad_s
-
-#     def reset_parameters(self) -> None:
-#         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-#         bound = (3 ** 0.5) * std
-#         with torch.no_grad():
-#             self.weight.uniform_(-bound, bound)
-
-#     def forward(self, x: Tensor):
-#         if self.use_fp8 and self.training:
-#             _x = x.flatten(0, -2)
-#             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
-#             return out.reshape(*x.shape[:-1], -1)
-#         else:
-#             return F.linear(x, self.weight.type_as(x))
-
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
         self.use_fp8 = use_fp8
         self.x_s = x_s
-        self.w_s = w_s  
+        self.w_s = w_s
         self.grad_s = grad_s
-        
-        if use_fp8:
-            from deep_gemm.jit_kernels import ceil_div
-            
-            # Ensure dimensions are aligned to 128 for DeepGEMM
-            if in_features % 128 != 0:
-                raise ValueError(f"in_features ({in_features}) must be divisible by 128 for DeepGEMM")
-            
-            # DeepGEMM scaling tensors
-            self.k_blocks = ceil_div(in_features, 128)
-            self.n_blocks = ceil_div(out_features, 128)
-            
-            # RHS scaling: [⌈n / 128⌉, ⌈k / 128⌉]  
-            self.register_buffer('w_scales', 
-                torch.ones(self.n_blocks, self.k_blocks, dtype=torch.float32), 
-                persistent=False)
 
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
@@ -321,49 +224,11 @@ class CastedLinear(nn.Linear):
 
     def forward(self, x: Tensor):
         if self.use_fp8 and self.training:
-            from deep_gemm.jit_kernels import ceil_div
-            
-            batch_size = x.shape[0] if x.ndim == 2 else x.view(-1, x.size(-1)).shape[0]
-            
-            # LHS scaling: [batch_size, ⌈k / 128⌉]
-            x_scales = torch.ones(batch_size, self.k_blocks, dtype=torch.float32, device=x.device)
-            
-            # Update scales dynamically
-            self._update_scales(x.view(-1, x.size(-1)), self.weight, x_scales)
-            
             _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_scales, self.w_scales, self.grad_s)[0]
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
             return F.linear(x, self.weight.type_as(x))
-            
-    def _update_scales(self, x, w, x_scales):
-        from deep_gemm.jit_kernels import ceil_div
-        
-        # Update LHS scales: per-batch, per-128-channels
-        if x.size(1) % 128 == 0:
-            x_reshaped = x.view(x.size(0), -1, 128)  # [batch, k_blocks, 128]
-            x_scales.copy_(x_reshaped.abs().amax(dim=2) / 448.0)  # [batch, k_blocks]
-        else:
-            # Handle non-aligned case by padding
-            pad_size = 128 - (x.size(1) % 128)
-            x_padded = F.pad(x, (0, pad_size))
-            x_reshaped = x_padded.view(x_padded.size(0), -1, 128)
-            x_scales.copy_(x_reshaped.abs().amax(dim=2) / 448.0)
-        
-        # Update RHS scales: per-128x128 blocks (less frequent updates)
-        if not hasattr(self, '_w_scales_initialized') or torch.rand(1).item() < 0.01:  # Update 1% of the time
-            if w.size(0) % 128 == 0 and w.size(1) % 128 == 0:
-                w_reshaped = w.view(self.n_blocks, 128, self.k_blocks, 128)  # [n_blocks, 128, k_blocks, 128]
-                self.w_scales.copy_(w_reshaped.abs().amax(dim=(1, 3)) / 448.0)  # [n_blocks, k_blocks]
-            else:
-                # Handle non-aligned weights by padding
-                pad_h = 128 - (w.size(0) % 128) if w.size(0) % 128 != 0 else 0
-                pad_w = 128 - (w.size(1) % 128) if w.size(1) % 128 != 0 else 0
-                w_padded = F.pad(w, (0, pad_w, 0, pad_h))
-                w_reshaped = w_padded.view(self.n_blocks, 128, self.k_blocks, 128)
-                self.w_scales.copy_(w_reshaped.abs().amax(dim=(1, 3)) / 448.0)
-            self._w_scales_initialized = True
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -455,9 +320,6 @@ def next_multiple_of_n(v: float | int, *, n: int):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
-        # Ensure model_dim is aligned to 128 for DeepGEMM
-        if model_dim % 128 != 0:
-            raise ValueError(f"model_dim ({model_dim}) must be divisible by 128 for DeepGEMM")
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -636,20 +498,8 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-# model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
-#                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
-
-# In your main function, ensure model_dim is aligned
-model_dim = 768  # Already aligned to 128
-assert model_dim % 128 == 0, f"model_dim must be divisible by 128, got {model_dim}"
-
-# For the lm_head, ensure vocab_size extension is aligned
-vocab_size_extended = next_multiple_of_n(args.vocab_size, n=128)
-assert vocab_size_extended % 128 == 0
-
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, 
-                       model_dim=model_dim, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
-
+model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
